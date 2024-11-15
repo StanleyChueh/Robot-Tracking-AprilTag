@@ -1,137 +1,117 @@
-import cv2
-import numpy as np
 import rclpy
-from sensor_msgs.msg import LaserScan
+from rclpy.node import Node
 from geometry_msgs.msg import Twist
-import time
-from apriltag import apriltag
+from tf2_ros import Buffer, TransformListener
+from tf_transformations import euler_from_quaternion
+import math
+import tf2_ros
 
-# Dictionary to store stop times for each tag_id
-tag_stop_times = {}  
+class AprilTagFollowing(Node):
+    def __init__(self):
+        super().__init__('apriltag_following')
 
-def calculate_center(rect):
-    center_x = int((rect[0][0][0] + rect[2][0][0]) / 2)
-    center_y = int((rect[0][0][1] + rect[2][0][1]) / 2)
-    return center_x, center_y
+        # Publisher for movement commands
+        self.cmd_vel_publisher = self.create_publisher(Twist, '/cmd_vel', 10)
 
-def estimate_distance(apparent_width, tag_size, focal_length):
-    distance = (tag_size * focal_length) / apparent_width
-    return distance
+        # TF Buffer and Listener
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
 
-def draw_apriltag(frame, detection, tag_size, focal_length):
-    tag_id = detection["id"]
-    rect = detection["lb-rb-rt-lt"]
-    rect = np.array(rect, dtype=np.int32).reshape((-1, 1, 2))
+        # Parameters for tracking behavior
+        self.linear_speed = 0.1     # Linear speed (m/s)
+        self.angular_speed = 0.5    # Maximum angular speed (rad/s)
+        self.x_threshold = 0.1      # Horizontal offset threshold for centering
+        self.follow_distance = 0.6  # Desired distance from the AprilTag (meters)
+        self.stale_timeout = 0.5    # Timeout in seconds for stale transforms
 
-    center = calculate_center(rect)
-    apparent_width = abs(rect[0][0][0] - rect[1][0][0])
-    distance = estimate_distance(apparent_width, tag_size, focal_length)
+        # Frame names
+        self.tag_frame = "tag36h11:2"
+        self.camera_frame = "camera_color_optical_frame"
+        self.robot_frame = "base_link"
 
-    cv2.polylines(frame, [rect], isClosed=True, color=(0, 255, 0), thickness=2)
-    cv2.putText(frame, f"ID: {tag_id}", (center[0] - 10, center[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                (0, 255, 0), 2)
+        # State variable to track tag detection
+        self.tag_detected = False
 
-def stop_callback(timer, twist, tag_id, cmd_vel_pub):
-    # Stop callback, stop the robot or take appropriate action
-    print(f"Stopping for three seconds for AprilTag {tag_id}...")
-    twist.linear.x = 0.0  # Stop linear movement
-    twist.angular.z = 0.0  # Stop angular movement
-    cmd_vel_pub.publish(twist)
+        self.get_logger().info("AprilTag following node initialized using TF transforms.")
 
-    time.sleep(3)
+        # Timer to call the follow_tag function periodically
+        self.timer = self.create_timer(0.1, self.follow_tag)
 
-def april_tag_callback(frame, detector, tag_size, focal_length, expected_tag_id, node, cmd_vel_pub):
-    global tag_stop_times
+    def follow_tag(self):
+        try:
+            # Lookup the transform from the camera to the AprilTag frame
+            camera_to_tag = self.tf_buffer.lookup_transform(self.camera_frame, self.tag_frame, rclpy.time.Time())
 
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    detections = detector.detect(gray)
-    
-    if not detections:
-        # No AprilTag detected, return None (empty)
-        return None, expected_tag_id
+            # Check if the transform is stale
+            current_time = self.get_clock().now()
+            transform_time = camera_to_tag.header.stamp.sec + camera_to_tag.header.stamp.nanosec * 1e-9
+            time_diff = current_time.nanoseconds * 1e-9 - transform_time
 
-    twist = Twist()
-    correct_tag_detected = False  # Flag to check if the correct tag is detected
+            if time_diff > self.stale_timeout:
+                self.get_logger().warn(f"Stale transform detected (time_diff: {time_diff:.2f}s). Stopping the robot.")
+                self.stop_robot()
+                self.tag_detected = False  # Update state to indicate tag is lost
+                return
 
-    for detection in detections:
-        tag_id = detection["id"]
-        rect = detection["lb-rb-rt-lt"]
-        rect = np.array(rect, dtype=np.int32).reshape((-1, 1, 2))
+            # Update the state to indicate the tag is detected
+            self.tag_detected = True
+            self.get_logger().info(f"Transform found: {camera_to_tag}")
 
-        draw_apriltag(frame, detection, tag_size, focal_length)  # Draw bounding box and display ID
+            # Process the transform if it exists
+            position = camera_to_tag.transform.translation
+            orientation = camera_to_tag.transform.rotation
 
-        center = calculate_center(rect)
-        apparent_width = abs(rect[0][0][0] - rect[1][0][0])
-        distance = estimate_distance(apparent_width, tag_size, focal_length)
+            # Calculate distance and yaw
+            distance = math.sqrt(position.x ** 2 + position.y ** 2 + position.z ** 2)
+            _, _, yaw = euler_from_quaternion([orientation.x, orientation.y, orientation.z, orientation.w])
 
-        if tag_id == expected_tag_id and tag_id not in tag_stop_times:
-            correct_tag_detected = True  # Set the flag if the correct tag is detected
+            self.get_logger().info(f"Distance to AprilTag: {distance:.2f} m, Horizontal Offset: {position.x:.2f} m, Yaw angle: {yaw:.2f} rad")
 
-            if distance < 0.45:
-                print(f"Stopping for three seconds for AprilTag {tag_id}...")
-                tag_stop_times[tag_id] = True  # Mark the tag as printed
+            # Initialize the twist command
+            twist = Twist()
 
-                current_time = time.time()
-                tag_stop_times[str(tag_id) + "_time"] = current_time  # Update stop time
+            # Forward motion logic
+            if distance > self.follow_distance:
+                twist.linear.x = self.linear_speed
+            else:
+                twist.linear.x = 0.0  # Stop forward movement if close enough
 
-                stop_timer = node.create_timer(3.0, lambda timer: stop_callback(timer, twist, tag_id, cmd_vel_pub))
+            # Horizontal centering logic based on x-position of tag in camera frame
+            if abs(position.x) > self.x_threshold:
+                # Scale angular velocity based on horizontal offset
+                twist.angular.z = -self.angular_speed * position.x
+                self.get_logger().info(f"Adjusting position: {'Right' if position.x > 0 else 'Left'}")
+            else:
+                twist.angular.z = 0.0  # Stop turning if centered
 
-                print(f"Detected AprilTag {tag_id}, distance: {distance}")
-                return twist, expected_tag_id + 1  # Move to the next expected tag ID
+            # Publish the velocity command
+            self.cmd_vel_publisher.publish(twist)
 
-            if center[0] < 80:
-                print("Turning Left!")
-                twist.angular.z = 0.5
-            elif 80 <= center[0] <= 89:
-                print("Going Forward!")
-                twist.linear.x = 0.1
-            elif center[0] > 89:
-                print("Turning Right!")
-                twist.angular.z = -0.5
+        except (tf2_ros.LookupException, tf2_ros.ExtrapolationException):
+            # Handle loss of AprilTag frame
+            if self.tag_detected:
+                self.get_logger().warn(f"AprilTag frame {self.tag_frame} not found. Stopping the robot.")
+                self.stop_robot()
+                self.tag_detected = False  # Update state to indicate tag is lost
 
-    # If the correct tag is not detected, stop publishing cmd_vel
-    if not correct_tag_detected:
-        return None, expected_tag_id
+    def stop_robot(self):
+        """Stops the robot by publishing zero velocities."""
+        stop_msg = Twist()  # Twist message with all zeros (default)
+        self.cmd_vel_publisher.publish(stop_msg)
+        self.get_logger().info("Robot stopped.")
 
-    # If no AprilTag triggered any return, return the twist without publishing cmd_vel
-    return twist, expected_tag_id
+def main(args=None):
+    rclpy.init(args=args)
+    node = AprilTagFollowing()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.stop_robot()
+        node.destroy_node()
+        rclpy.shutdown()
 
-def main():
-    global tag_stop_times
-
-    focal_length = 3.67  
-    tag_size = 0.16  
-    expected_tag_id = 0
-
-    detector = apriltag("tag36h11")
-
-    rclpy.init()
-    node = rclpy.create_node('apriltag_follower')
-    cmd_vel_pub = node.create_publisher(Twist, 'cmd_vel', 10)
-    print("Publisher created successfully")
-
-    cap = cv2.VideoCapture(0)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 160)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 120)
-
-    while rclpy.ok():
-        ret, frame = cap.read()
-        frame = cv2.resize(frame, (160, 120))
-
-        twist_apriltag, expected_tag_id = april_tag_callback(frame, detector, tag_size, focal_length, expected_tag_id, node, cmd_vel_pub)
-
-        if twist_apriltag is not None:
-            cmd_vel_pub.publish(twist_apriltag)
-
-        cv2.imshow("AprilTag Detection", frame)
-
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
-            break
-
-    cap.release()
-    cv2.destroyAllWindows()
-    rclpy.shutdown()
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
+
